@@ -22,6 +22,7 @@
 #include <string>
 
 #include "vrto3dlib/json_manager.h"
+#include "uevr_receiver.hpp"
 
  // Forward declare XINPUT_STATE
 struct _XINPUT_STATE;
@@ -57,6 +58,14 @@ public:
     void LoadSettings(StereoDisplayDriverConfiguration& config);
     void ResetProjection();
     void Init(uint32_t device_index);
+    void SetUEVREffectiveDepth(float depth);
+    void SetUEVREffectiveIPD(float ipd);
+    void SetUEVREffectiveConvergence(float convergence);
+    float GetUEVREffectiveConvergence();
+    void SetAimCorrection(float correction);
+    void SetAimBase(float base);
+    void SetMonitorMode(bool enable);
+    bool IsMonitorMode() const;
 
 private:
     StereoDisplayDriverConfiguration config_;
@@ -65,6 +74,11 @@ private:
     std::atomic< float > fov_;
     std::atomic< uint32_t > device_index_;
 
+    std::atomic< float > uevr_effective_depth_;
+    std::atomic< float > uevr_effective_convergence_;
+    std::atomic< float > uevr_aim_correction_{0.0f};
+    std::atomic< float > uevr_aim_base_{0.0f};
+    std::atomic< bool > monitor_mode_{false};
     std::shared_mutex  cfg_mutex_;
 };
 
@@ -92,6 +106,7 @@ public:
 
     void LoadSettings(const std::string& app_name, uint32_t app_pid, vr::EVREventType status);
     void SetAsync(bool enable);
+    void parse_uevr_modifiers(const std::string& app_name);  // v3.1
 
 private:
     std::unique_ptr< StereoDisplayComponent > stereo_display_component_;

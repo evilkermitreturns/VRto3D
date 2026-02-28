@@ -34,6 +34,9 @@
 #pragma comment (lib, "WSock32.Lib")
 #include <windows.h>
 #include <xinput.h>
+#include <fstream>
+#include <Shlobj.h>
+#include <nlohmann/json.hpp>
 
 
 // Load settings from default.vrsettings
@@ -352,9 +355,334 @@ void MockControllerDeviceDriver::PoseUpdateThread()
 
     while (is_active_)
     {
+        // Calculate delta time FIRST (needed for v3.1 depth smoothing)
         auto currentTime = std::chrono::high_resolution_clock::now();
         auto deltaTime = std::chrono::duration_cast<std::chrono::duration<float>>(currentTime - lastTime).count();
         lastTime = currentTime;
+
+        // === UEVR BRIDGE UPDATE ===
+        if (stereo_display_component_) {
+            static int uevr_log_counter = 0;
+            static bool uevr_was_connected = false;
+
+            float current_depth = stereo_display_component_->GetDepth();
+            float current_convergence = stereo_display_component_->GetConvergence();
+            float current_fov = stereo_display_component_->GetFoV();
+
+            // v3.4: FOV compensation moved AFTER new_sep and new_conv are computed (see below)
+
+            bool connected = uevr::receiver().is_connected();
+            if (connected != uevr_was_connected) {
+                DriverLog("UEVR Bridge: %s\n", connected ? "CONNECTED" : "DISCONNECTED");
+                // v3.4: Log protocol mismatch if connection failed due to wrong magic
+                if (!connected) {
+                    uint32_t mismatch = uevr::receiver().get_last_magic_mismatch();
+                    if (mismatch != 0) {
+                        DriverLog("UEVR protocol mismatch: expected 0x%08X, got 0x%08X. Check UEVR build.\n",
+                            UEVR_VRTO3D_MAGIC, mismatch);
+                    }
+                }
+                uevr_was_connected = connected;
+            }
+
+            // === AUTO-DEPTH (unified — no hard threshold switch) ===
+            // Always use smoothed depth path to prevent compositor jolt
+            // on threshold crossing when depth_multiplier approaches 1.0.
+            float new_sep;
+
+            if (uevr::receiver().is_connected() && uevr::receiver().has_valid_data()) {
+                // Always use smoothed path — even when returning to 1.0
+                new_sep = uevr::receiver().get_depth_for_rendering(deltaTime);
+
+                bool depth_active = std::abs(uevr::receiver().get_depth_multiplier() - 1.0f) > 0.01f;
+                uevr::receiver().mark_depth_active(depth_active);
+
+                // v3.4: Log depth state transitions (active/inactive)
+                static bool prev_depth_active = false;
+                if (depth_active != prev_depth_active) {
+                    DriverLog("UEVR depth: %s (eff=%.4f mult=%.3f)\n",
+                        depth_active ? "ACTIVE" : "INACTIVE",
+                        new_sep, uevr::receiver().get_depth_multiplier());
+                    prev_depth_active = depth_active;
+                }
+
+                if (depth_active && uevr_log_counter++ % 200 == 0) {
+                    DriverLog("UEVR depth: eff=%.4f base=%.4f mult=%.3f\n",
+                        new_sep, current_depth, uevr::receiver().get_depth_multiplier());
+                }
+            } else {
+                new_sep = current_depth;
+            }
+
+            stereo_display_component_->SetUEVREffectiveDepth(new_sep);
+
+            // Monitor mode: latch on valid data, don't revert on stale (lesson 20)
+            if (uevr::receiver().is_connected() && uevr::receiver().has_valid_data()) {
+                stereo_display_component_->SetMonitorMode(uevr::receiver().get_monitor_mode());
+
+                // v3.3: Log stereo depth hint — first occurrence + periodic refresh (~30s)
+                static bool hint_logged = false;
+                static int hint_log_cooldown = 0;
+                float hint = uevr::receiver().get_stereo_depth_hint();
+                if (hint > 0.001f) {
+                    if (!hint_logged || ++hint_log_cooldown >= 2700) { // ~30s at 90fps
+                        float prop_ipd = stereo_display_component_->GetConfig().depth;
+                        DriverLog("UEVR stereo_depth_hint: %.4f  config.depth: %.4f  Prop_IPD: %.4f  ratio: %.2fx\n",
+                            hint, current_depth, prop_ipd, hint / (std::max)(current_depth, 0.001f));
+                        hint_logged = true;
+                        hint_log_cooldown = 0;
+                    }
+                }
+            }
+            // === END AUTO-DEPTH ===
+
+            // === DEFERRED AUTO-DEPTH FOR NO-PROFILE GAMES ===
+            static bool auto_depth_applied = false;
+            if (no_profile_.load() && !auto_depth_applied && uevr::receiver().is_connected()) {
+                float ad = 0.0f, ac = 0.0f;
+                if (uevr::receiver().calculate_auto_stereo(ad, ac)) {
+                    auto cfg = stereo_display_component_->GetConfig();
+                    cfg.depth = ad;
+                    cfg.convergence = ac;
+                    stereo_display_component_->LoadSettings(cfg);
+                    DriverLog("Deferred auto-stereo: d=%.4f c=%.2f ws=%.1f\n",
+                        ad, ac, uevr::receiver().get_world_scale());
+                    BeepSuccess();
+                    app_updated_ = true;
+                    no_profile_ = false;
+                    auto_depth_applied = true;
+                }
+            }
+            if (app_updated_.load()) auto_depth_applied = false;
+            // === END DEFERRED AUTO-DEPTH ===
+
+            // === UEVR DEPTH COMMANDS (Calibrate, +3D, -3D) ===
+            uint8_t depth_cmd = uevr::receiver().get_depth_request();
+            if (depth_cmd >= 2 && depth_cmd <= 9) {
+                if (depth_cmd == 2) {  // Calibrate from world_scale
+                    float ad = 0.0f, ac = 0.0f;
+                    if (uevr::receiver().calculate_auto_stereo(ad, ac)) {
+                        auto cfg = stereo_display_component_->GetConfig();
+                        cfg.depth = ad;
+                        cfg.convergence = ac;
+                        stereo_display_component_->LoadSettings(cfg);
+                        DriverLog("Calibrate 3D: d=%.4f c=%.2f ws=%.1f\n",
+                            ad, ac, uevr::receiver().get_world_scale());
+                        BeepSuccess();
+                        app_updated_ = true;
+                    }
+                } else if (depth_cmd == 3) {  // -3D: Decrease depth 20%
+                    float new_d = stereo_display_component_->GetDepth() * 0.8f;
+                    new_d = (std::max)(0.005f, new_d);
+                    stereo_display_component_->AdjustDepth(new_d, false);
+                    uevr::receiver().set_base_depth(new_d);
+                    BeepSuccess();
+                    app_updated_ = true;
+                } else if (depth_cmd == 4) {  // +3D: Increase depth 20%
+                    float new_d = stereo_display_component_->GetDepth() * 1.2f;
+                    new_d = (std::min)(1.0f, new_d);
+                    stereo_display_component_->AdjustDepth(new_d, false);
+                    uevr::receiver().set_base_depth(new_d);
+                    BeepSuccess();
+                    app_updated_ = true;
+                } else if (depth_cmd == 5) {  // --3D: Big decrease depth 40%
+                    float new_d = stereo_display_component_->GetDepth() * 0.6f;
+                    new_d = (std::max)(0.005f, new_d);
+                    stereo_display_component_->AdjustDepth(new_d, false);
+                    uevr::receiver().set_base_depth(new_d);
+                    BeepSuccess();
+                    app_updated_ = true;
+                } else if (depth_cmd == 6) {  // ++3D: Big increase depth 40%
+                    float new_d = stereo_display_component_->GetDepth() * 1.4f;
+                    new_d = (std::min)(1.0f, new_d);
+                    stereo_display_component_->AdjustDepth(new_d, false);
+                    uevr::receiver().set_base_depth(new_d);
+                    BeepSuccess();
+                    app_updated_ = true;
+                } else if (depth_cmd == 8) {  // ---3D: Huge decrease depth 60%
+                    float new_d = stereo_display_component_->GetDepth() * 0.4f;
+                    new_d = (std::max)(0.005f, new_d);
+                    stereo_display_component_->AdjustDepth(new_d, false);
+                    uevr::receiver().set_base_depth(new_d);
+                    BeepSuccess();
+                    app_updated_ = true;
+                } else if (depth_cmd == 9) {  // +++3D: Huge increase depth 60%
+                    float new_d = stereo_display_component_->GetDepth() * 1.6f;
+                    new_d = (std::min)(1.0f, new_d);
+                    stereo_display_component_->AdjustDepth(new_d, false);
+                    uevr::receiver().set_base_depth(new_d);
+                    BeepSuccess();
+                    app_updated_ = true;
+                }
+                uevr::receiver().clear_depth_request();
+            }
+            // === END UEVR DEPTH COMMANDS ===
+
+            // === SETTLED-STATE PROJECTION UPDATES ===
+            //
+            // GetProjectionRaw() reads depth/convergence atomics directly,
+            // so smooth per-frame rendering happens WITHOUT ResetProjection().
+            //
+            // ResetProjection() is a heavyweight compositor re-sync that
+            // fires VREvent_LensDistortionChanged. Calling it during active
+            // transitions causes visible stepping (the v3.1 jitter source).
+            //
+            // NEW APPROACH: Fire ResetProjection ONLY when values SETTLE:
+            //   (a) First time — always fire
+            //   (b) Big jump >20% — immediate fire
+            //   (c) Settled — both depth+conv < 0.1% change for 10 frames
+            //   (d) Staleness safety — if committed drifts >5% for 2s, force
+            //
+            // Atomics are updated EVERY frame for smooth per-frame rendering.
+            // ResetProjection only commits metadata when transition is done.
+            //
+            static float committed_sep = -1.0f;
+            static float committed_conv = -1.0f;
+            static int settled_frames = 0;
+            static float prev_frame_sep = -1.0f;
+            static float prev_frame_conv = -1.0f;
+            static auto stale_timer_start = std::chrono::steady_clock::now();
+            static bool stale_timer_active = false;
+
+            constexpr float SETTLED_THRESHOLD = 0.001f;     // <0.1% frame-over-frame = settled
+            constexpr int   SETTLED_FRAME_COUNT = 10;        // 10 frames of stability
+            constexpr float BIG_JUMP_THRESHOLD = 0.20f;      // >20% = immediate fire
+            constexpr float STALE_DRIFT_THRESHOLD = 0.05f;   // >5% drift from committed
+            constexpr auto  STALE_TIMEOUT = std::chrono::seconds(2);
+
+            // === SCENE-AWARE AUTO-CONVERGENCE ===
+            float new_conv = uevr::receiver().get_convergence_for_rendering(deltaTime);
+            stereo_display_component_->SetUEVREffectiveConvergence(new_conv);
+            stereo_display_component_->SetAimCorrection(uevr::receiver().get_stereo_aim_correction());
+            stereo_display_component_->SetAimBase(uevr::receiver().get_stereo_aim_base());
+
+            // v3.4: Convergence debug log (~every 200 frames when active)
+            {
+                float conv_mult = uevr::receiver().get_smoothed_conv_multiplier();
+                bool conv_active = std::abs(conv_mult - 1.0f) > 0.01f;
+                static uint32_t conv_log_counter = 0;
+                if (conv_active && conv_log_counter++ % 200 == 0) {
+                    DriverLog("UEVR conv: eff=%.2f mult=%.3f dm=%.3f zm=%d fs=%.3f ws=%.1f\n",
+                        new_conv, conv_mult,
+                        uevr::receiver().get_depth_multiplier(),
+                        uevr::receiver().get_zoom_mode(),
+                        uevr::receiver().get_fov_scale(),
+                        uevr::receiver().get_world_scale());
+                }
+            }
+
+            // v3.4: FOV compensation using ACTUAL effective values (moved from before new_sep/new_conv were available)
+            float fov_adj = 0.0f;
+            if (current_convergence > 0.001f && new_conv > 0.001f) {
+                float base_offset = current_depth * 0.5f / current_convergence;
+                float eff_offset = new_sep * 0.5f / new_conv;
+                float delta = eff_offset - base_offset;
+                if (std::abs(delta) > 0.0001f) {
+                    fov_adj = 2.0f * std::atan(std::abs(delta)) * (180.0f / 3.14159265f);
+                    if (delta < 0.0f) fov_adj = -fov_adj;  // Narrower offset = narrower FOV
+                }
+            }
+
+            uevr::receiver().update(
+                current_depth,
+                current_convergence,
+                current_fov,
+                fov_adj,
+                stereo_display_component_->GetConfig().tab_enable ? 0 : 1,
+                !no_profile_.load()
+            );
+
+            bool need_projection_reset = false;
+
+            // First-time initialization
+            if (committed_sep < 0.0f) {
+                stereo_display_component_->SetUEVREffectiveIPD(new_sep);
+                committed_sep = new_sep;
+                committed_conv = new_conv;
+                prev_frame_sep = new_sep;
+                prev_frame_conv = new_conv;
+                need_projection_reset = true;
+            } else {
+                // Check for big jump (immediate fire)
+                float rel_sep = (committed_sep > 0.0f) ? std::abs(new_sep - committed_sep) / committed_sep : 0.0f;
+                float rel_conv = (committed_conv > 0.0f) ? std::abs(new_conv - committed_conv) / committed_conv : 0.0f;
+
+                if (rel_sep > BIG_JUMP_THRESHOLD || rel_conv > BIG_JUMP_THRESHOLD) {
+                    stereo_display_component_->SetUEVREffectiveIPD(new_sep);
+                    committed_sep = new_sep;
+                    committed_conv = new_conv;
+                    need_projection_reset = true;
+                    settled_frames = 0;
+                    stale_timer_active = false;
+                } else {
+                    // Check frame-over-frame stability
+                    float frame_delta_sep = (prev_frame_sep > 0.0f) ? std::abs(new_sep - prev_frame_sep) / prev_frame_sep : 0.0f;
+                    float frame_delta_conv = (prev_frame_conv > 0.0f) ? std::abs(new_conv - prev_frame_conv) / prev_frame_conv : 0.0f;
+
+                    if (frame_delta_sep < SETTLED_THRESHOLD && frame_delta_conv < SETTLED_THRESHOLD) {
+                        settled_frames++;
+                    } else {
+                        settled_frames = 0;
+                    }
+
+                    // Settled: both stable for N frames AND committed value has drifted
+                    if (settled_frames >= SETTLED_FRAME_COUNT) {
+                        float drift_sep = (committed_sep > 0.0f) ? std::abs(new_sep - committed_sep) / committed_sep : 0.0f;
+                        float drift_conv = (committed_conv > 0.0f) ? std::abs(new_conv - committed_conv) / committed_conv : 0.0f;
+
+                        if (drift_sep > SETTLED_THRESHOLD || drift_conv > SETTLED_THRESHOLD) {
+                            stereo_display_component_->SetUEVREffectiveIPD(new_sep);
+                            committed_sep = new_sep;
+                            committed_conv = new_conv;
+                            need_projection_reset = true;
+                            stale_timer_active = false;
+                        }
+                        settled_frames = 0;  // Reset after check
+                    }
+
+                    // Staleness safety: if committed value drifts >5% for >2s, force commit
+                    float stale_drift = (std::max)(rel_sep, rel_conv);
+                    if (stale_drift > STALE_DRIFT_THRESHOLD) {
+                        if (!stale_timer_active) {
+                            stale_timer_start = std::chrono::steady_clock::now();
+                            stale_timer_active = true;
+                        } else {
+                            auto elapsed = std::chrono::steady_clock::now() - stale_timer_start;
+                            if (elapsed >= STALE_TIMEOUT) {
+                                stereo_display_component_->SetUEVREffectiveIPD(new_sep);
+                                committed_sep = new_sep;
+                                committed_conv = new_conv;
+                                need_projection_reset = true;
+                                stale_timer_active = false;
+                                settled_frames = 0;
+                            }
+                        }
+                    } else {
+                        stale_timer_active = false;
+                    }
+                }
+            }
+
+            prev_frame_sep = new_sep;
+            prev_frame_conv = new_conv;
+
+            if (need_projection_reset) {
+                stereo_display_component_->ResetProjection();
+            }
+
+            // v3.4: ResetProjection frequency diagnostics
+            static uint32_t reset_proj_count = 0;
+            static uint32_t diag_frame_count = 0;
+            if (need_projection_reset) reset_proj_count++;
+            if (++diag_frame_count % 1000 == 0) {
+                if (reset_proj_count > 0) {
+                    DriverLog("ResetProjection: %u in last 1000 frames (%.1f%%)\n",
+                        reset_proj_count, reset_proj_count * 0.1f);
+                }
+                reset_proj_count = 0;
+            }
+        }
+        // === END UEVR BRIDGE UPDATE ===
 
         XINPUT_STATE state;
         ZeroMemory(&state, sizeof(XINPUT_STATE));
@@ -461,20 +789,23 @@ void MockControllerDeviceDriver::PoseUpdateThread()
             pose.vecPosition[1] = config.hmd_height - 1.0;
         }
 
+        // v3.4: Clamp deltaTime to prevent velocity/acceleration spikes on frame stalls
+        float safe_dt = (std::max)(deltaTime, 0.001f);
+
         // Calculate velocity using known update interval
-        pose.vecVelocity[0] = (pose.vecPosition[0] - lastPose.vecPosition[0]) / deltaTime;
-        pose.vecVelocity[1] = (pose.vecPosition[1] - lastPose.vecPosition[1]) / deltaTime;
-        pose.vecVelocity[2] = (pose.vecPosition[2] - lastPose.vecPosition[2]) / deltaTime;
-        pose.vecAngularVelocity[0] = AngleDifference(pitchRadians, lastPitch) / deltaTime; // Pitch angular velocity
-        pose.vecAngularVelocity[1] = AngleDifference(yawRadians, lastYaw) / deltaTime; // Yaw angular velocity
+        pose.vecVelocity[0] = (pose.vecPosition[0] - lastPose.vecPosition[0]) / safe_dt;
+        pose.vecVelocity[1] = (pose.vecPosition[1] - lastPose.vecPosition[1]) / safe_dt;
+        pose.vecVelocity[2] = (pose.vecPosition[2] - lastPose.vecPosition[2]) / safe_dt;
+        pose.vecAngularVelocity[0] = AngleDifference(pitchRadians, lastPitch) / safe_dt; // Pitch angular velocity
+        pose.vecAngularVelocity[1] = AngleDifference(yawRadians, lastYaw) / safe_dt; // Yaw angular velocity
         pose.vecAngularVelocity[2] = 0.0f;
 
         // Calculate acceleration based on change in velocity
-        pose.vecAcceleration[0] = (pose.vecVelocity[0] - lastPose.vecVelocity[0]) / deltaTime;
-        pose.vecAcceleration[1] = (pose.vecVelocity[1] - lastPose.vecVelocity[1]) / deltaTime;
-        pose.vecAcceleration[2] = (pose.vecVelocity[2] - lastPose.vecVelocity[2]) / deltaTime;
-        pose.vecAngularAcceleration[0] = (pose.vecAngularVelocity[0] - lastPose.vecAngularVelocity[0]) / deltaTime;
-        pose.vecAngularAcceleration[1] = (pose.vecAngularVelocity[1] - lastPose.vecAngularVelocity[1]) / deltaTime;
+        pose.vecAcceleration[0] = (pose.vecVelocity[0] - lastPose.vecVelocity[0]) / safe_dt;
+        pose.vecAcceleration[1] = (pose.vecVelocity[1] - lastPose.vecVelocity[1]) / safe_dt;
+        pose.vecAcceleration[2] = (pose.vecVelocity[2] - lastPose.vecVelocity[2]) / safe_dt;
+        pose.vecAngularAcceleration[0] = (pose.vecAngularVelocity[0] - lastPose.vecAngularVelocity[0]) / safe_dt;
+        pose.vecAngularAcceleration[1] = (pose.vecAngularVelocity[1] - lastPose.vecAngularVelocity[1]) / safe_dt;
         pose.vecAngularAcceleration[2] = 0.0f;
 
         pose.poseIsValid = true;
@@ -556,12 +887,14 @@ void MockControllerDeviceDriver::PollHotkeysThread() {
             // Ctrl+F3 Decrease Depth
             if (isCtrlDown() && isDown(VK_F3)) {
                 stereo_display_component_->AdjustDepth(-0.001f, true);
+                uevr::receiver().set_base_depth(stereo_display_component_->GetDepth());
                 if (isDown(VK_SHIFT)) stereo_display_component_->ResetProjection();
                 setOverlay(fmtDepthConv());
             }
             // Ctrl+F4 Increase Depth
             else if (isCtrlDown() && isDown(VK_F4)) {
                 stereo_display_component_->AdjustDepth(0.001f, true);
+                uevr::receiver().set_base_depth(stereo_display_component_->GetDepth());
                 if (isDown(VK_SHIFT)) stereo_display_component_->ResetProjection();
                 setOverlay(fmtDepthConv());
             }
@@ -627,9 +960,20 @@ void MockControllerDeviceDriver::PollHotkeysThread() {
             else if (sleep.save > 0) {
                 --sleep.save;
             }
-            // Ctrl+F11 Toggle Auto Depth
-            if (isCtrlDown() && isDown(VK_F11) && sleep.depth == 0) {
+            // Ctrl+F1 Toggle Auto Depth
+            if (isCtrlDown() && isDown(VK_F1) && sleep.depth == 0) {
                 use_auto_depth_ = !use_auto_depth_;
+                uevr::receiver().set_auto_depth_enabled(use_auto_depth_.load());
+                BeepSuccess();
+                setOverlay(use_auto_depth_.load() ? "Auto Depth: ON" : "Auto Depth: OFF");
+                sleep.depth = cfg.sleep_count_max;
+            }
+            // Ctrl+F2 Toggle Auto Convergence
+            else if (isCtrlDown() && isDown(VK_F2) && sleep.depth == 0) {
+                uevr::receiver().toggle_auto_convergence();
+                BeepSuccess();
+                setOverlay(uevr::receiver().is_auto_convergence_enabled() ?
+                    "Auto Convergence: ON" : "Auto Convergence: OFF");
                 sleep.depth = cfg.sleep_count_max;
             }
             else if (sleep.depth > 0) {
@@ -916,6 +1260,7 @@ void MockControllerDeviceDriver::LoadSettings(const std::string& app_name, uint3
         if (JsonManager().LoadProfileFromJson(app_name + "_config.json", config))
         {
             stereo_display_component_->LoadSettings(config);
+            parse_uevr_modifiers(app_name);  // v3.1: load depth curve overrides
             DriverLog("Loaded %s profile\n", app_name.c_str());
             BeepSuccess();
             app_updated_ = true;
@@ -926,8 +1271,23 @@ void MockControllerDeviceDriver::LoadSettings(const std::string& app_name, uint3
             }
         }
         else {
-            BeepFailure();
-            no_profile_ = true;
+            // No VRto3D profile — try auto-depth from UEVR world_scale
+            float auto_depth = 0.0f, auto_conv = 0.0f;
+            if (uevr::receiver().is_connected() &&
+                uevr::receiver().calculate_auto_stereo(auto_depth, auto_conv))
+            {
+                config.depth = auto_depth;
+                config.convergence = auto_conv;
+                stereo_display_component_->LoadSettings(config);
+                DriverLog("Auto-stereo from world_scale: d=%.4f c=%.2f ws=%.1f\n",
+                    auto_depth, auto_conv, uevr::receiver().get_world_scale());
+                BeepSuccess();
+                app_updated_ = true;
+            }
+            else {
+                BeepFailure();
+                no_profile_ = true;
+            }
         }
 
         SetAsync(config.async_enable);
@@ -979,6 +1339,7 @@ void MockControllerDeviceDriver::Deactivate()
     }
 
     // unassign our controller index (we don't want to be calling vrserver anymore after Deactivate() has been called
+    uevr::receiver().shutdown();
     device_index_ = vr::k_unTrackedDeviceIndexInvalid;
 }
 
@@ -988,7 +1349,8 @@ void MockControllerDeviceDriver::Deactivate()
 //-----------------------------------------------------------------------------
 
 StereoDisplayComponent::StereoDisplayComponent( const StereoDisplayDriverConfiguration &config )
-    : config_( config ), depth_(config.depth), convergence_(config.convergence), fov_(config.fov)
+    : config_( config ), depth_(config.depth), convergence_(config.convergence), fov_(config.fov),
+      uevr_effective_depth_(config.depth), uevr_effective_convergence_(config.convergence)
 {
 }
 
@@ -1002,6 +1364,43 @@ void StereoDisplayComponent::Init(uint32_t device_index) {
 
 
 }
+
+//-----------------------------------------------------------------------------
+    // Purpose: Set effective depth from UEVR multiplier calculation
+    //-----------------------------------------------------------------------------
+void StereoDisplayComponent::SetUEVREffectiveDepth(float depth) {
+    uevr_effective_depth_.store(depth, std::memory_order_relaxed);
+}
+
+void StereoDisplayComponent::SetUEVREffectiveIPD(float ipd) {
+    vr::PropertyContainerHandle_t container = vr::VRProperties()->TrackedDeviceToPropertyContainer(device_index_);
+    vr::VRProperties()->SetFloatProperty(container, vr::Prop_UserIpdMeters_Float, ipd);
+}
+
+void StereoDisplayComponent::SetUEVREffectiveConvergence(float convergence) {
+    uevr_effective_convergence_.store(convergence, std::memory_order_relaxed);
+}
+
+float StereoDisplayComponent::GetUEVREffectiveConvergence() {
+    return uevr_effective_convergence_.load(std::memory_order_relaxed);
+}
+
+void StereoDisplayComponent::SetAimCorrection(float correction) {
+    uevr_aim_correction_.store(correction, std::memory_order_relaxed);
+}
+
+void StereoDisplayComponent::SetAimBase(float base) {
+    uevr_aim_base_.store(base, std::memory_order_relaxed);
+}
+
+void StereoDisplayComponent::SetMonitorMode(bool enable) {
+    monitor_mode_.store(enable, std::memory_order_relaxed);
+}
+
+bool StereoDisplayComponent::IsMonitorMode() const {
+    return monitor_mode_.load(std::memory_order_relaxed);
+}
+
 
 
 //-----------------------------------------------------------------------------
@@ -1040,6 +1439,23 @@ void StereoDisplayComponent::GetEyeOutputViewport( vr::EVREye eEye, uint32_t *pn
     {
         eEye = static_cast<vr::EVREye>(!static_cast<bool> (eEye));
     }
+
+    // Monitor mode: clean full-height SBS, no VR-specific cropping (lesson 28, 63)
+    if (monitor_mode_.load(std::memory_order_relaxed))
+    {
+        uint32_t half = config_.window_width / 2;
+        *pnY = 0;
+        *pnHeight = config_.window_height;
+        if (eEye == vr::Eye_Left) {
+            *pnX = 0;
+            *pnWidth = half;
+        } else {
+            *pnX = half;
+            *pnWidth = config_.window_width - half;  // Remainder for exact coverage
+        }
+        return;
+    }
+
     // Use Top and Bottom Rendering
     if (config_.tab_enable)
     {
@@ -1103,16 +1519,59 @@ void StereoDisplayComponent::GetProjectionRaw( vr::EVREye eEye, float *pfLeft, f
     // Calculate vertical FOV in radians
     float verFovRadians = horFovRadians / config_.aspect_ratio;
 
-    // IPD-based horizontal offset
-    float sep = GetDepth();
-    float conv = GetConvergence();
+    // Monitor mode: symmetric frustum — UEVR handles convergence via projection [2][0]
+    if (monitor_mode_.load(std::memory_order_relaxed)) {
+        *pfTop = -verFovRadians;
+        *pfBottom = verFovRadians;
+        *pfLeft = -horFovRadians;
+        *pfRight = horFovRadians;
+        return;
+    }
+
+    // VR mode: asymmetric frustum with depth/convergence baked in
+    // IPD-based horizontal offset - use UEVR effective values for both depth and convergence
+    // PoseUpdateThread keeps these in sync (depth reduced when zoomed, convergence scene-aware)
+    float sep = uevr_effective_depth_.load();
+    float conv = uevr_effective_convergence_.load(std::memory_order_relaxed);
+    if (conv < 0.001f) conv = 0.001f;  // Prevent division by zero
     float eyeOffset = (eEye == vr::Eye_Left) ? sep * 0.5f / conv : -sep * 0.5f / conv;
+
+    // v3.5: Aim correction via ANTISYMMETRIC frustum shear
+    // Research-backed: ΔP_02 = ±(IPD_base - IPD_ads) / (2 * Z_focus)
+    // Applies correction PER-EYE with opposite signs to shift convergence,
+    // NOT the viewport. Gun stays centered; only where the two eyes converge changes.
+    float aim_base = uevr_aim_base_.load(std::memory_order_relaxed);
+    float aim_zoom = uevr_aim_correction_.load(std::memory_order_relaxed);
+    float base_depth = depth_.load(std::memory_order_relaxed);
+
+    // zoom_factor = 1 - depth_multiplier (how far IPD has been reduced)
+    // Dead zone + soft ramp to eliminate jitter at zoom boundary
+    float raw_zf = (base_depth > 0.001f) ? 1.0f - (sep / base_depth) : 0.0f;
+    raw_zf = (std::max)(0.0f, (std::min)(raw_zf, 1.0f));
+    constexpr float ZF_DEAD = 0.02f;   // Ignore when barely zoomed (dm > 0.98)
+    constexpr float ZF_RAMP = 0.05f;   // Soft ramp from 0.02 to 0.05
+    float zoom_factor;
+    if (raw_zf < ZF_DEAD) {
+        zoom_factor = 0.0f;
+    } else if (raw_zf < ZF_RAMP) {
+        zoom_factor = (raw_zf - ZF_DEAD) / (ZF_RAMP - ZF_DEAD) * ZF_RAMP;
+    } else {
+        zoom_factor = raw_zf;
+    }
+
+    // Differential correction: applied with SAME sign convention as eyeOffset
+    // Left eye (+) gets +correction → shears LEFT frustum right
+    // Right eye (-) gets -correction → shears RIGHT frustum left
+    // Net: convergence point shifts, viewport centers DON'T move
+    float aim_correction = aim_base + (aim_zoom * zoom_factor);
+    float eye_sign = (eEye == vr::Eye_Left) ? 1.0f : -1.0f;
+    float corrected_eyeOffset = eyeOffset + (eye_sign * aim_correction);
 
     // Set frustum bounds
     *pfTop = -verFovRadians;
     *pfBottom = verFovRadians;
-    *pfLeft = -horFovRadians + eyeOffset;
-    *pfRight = horFovRadians + eyeOffset;
+    *pfLeft = -horFovRadians + corrected_eyeOffset;
+    *pfRight = horFovRadians + corrected_eyeOffset;
 }
 
 //-----------------------------------------------------------------------------
@@ -1416,6 +1875,7 @@ void StereoDisplayComponent::LoadSettings(StereoDisplayDriverConfiguration& conf
     // Apply loaded settings
     AdjustDepth(config.depth, false);
     AdjustConvergence(config.convergence, false);
+    uevr::receiver().set_base_depth(config.depth);
     
     std::unique_lock<std::shared_mutex> lock(cfg_mutex_);
     config_ = config;
@@ -1436,4 +1896,66 @@ void StereoDisplayComponent::ResetProjection()
     vr::VREvent_Data_t temp;
     vr::VRServerDriverHost()->SetDisplayProjectionRaw(device_index_, eyeLeft, eyeRight);
     vr::VRServerDriverHost()->VendorSpecificEvent(device_index_, vr::VREvent_LensDistortionChanged, temp, 0.0f);
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: v3.1 - Parse uevr_modifiers from VRto3D game profile JSON
+//-----------------------------------------------------------------------------
+void MockControllerDeviceDriver::parse_uevr_modifiers(const std::string& app_name)
+{
+    uevr::receiver().clear_modifiers();
+
+    try {
+        char documents_path[MAX_PATH];
+        if (FAILED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, documents_path))) {
+            return;
+        }
+        std::string full_path = std::string(documents_path) + "\\My Games\\vrto3d\\" + app_name + "_config.json";
+
+        std::ifstream file(full_path);
+        if (!file.is_open()) {
+            return;
+        }
+
+        nlohmann::json json;
+        file >> json;
+
+        if (!json.contains("uevr_modifiers") || !json["uevr_modifiers"].is_object()) {
+            return;
+        }
+
+        auto& m = json["uevr_modifiers"];
+        uevr::ProfileModifiers mods{};
+        mods.active = true;
+
+        auto read_float = [&](const char* key, float& out) {
+            if (m.contains(key) && m[key].is_number())
+                out = m[key].get<float>();
+        };
+
+        read_float("depth_strength",    mods.depth_strength);
+        read_float("depth_min_floor",   mods.depth_min_floor);
+        read_float("ads_floor",         mods.ads_floor);
+        read_float("scope_floor",       mods.scope_floor);
+        read_float("cutscene_floor",    mods.cutscene_floor);
+        read_float("base_power",        mods.base_power);
+        read_float("extra_power",       mods.extra_power);
+        read_float("dead_zone",         mods.dead_zone);
+        read_float("transition_speed",  mods.transition_speed);
+        read_float("zoom_threshold",    mods.zoom_threshold);
+        read_float("base_fov_override", mods.base_fov_override);
+        // v3.4: Per-mode convergence blend overrides
+        read_float("blend_ads",         mods.blend_ads);
+        read_float("blend_scope",       mods.blend_scope);
+        read_float("blend_passive",     mods.blend_passive);
+
+        uevr::receiver().write_modifiers(mods);
+        DriverLog("v3.1: Loaded uevr_modifiers from %s_config.json\n", app_name.c_str());
+
+    } catch (const std::exception& e) {
+        DriverLog("v3.1: Error parsing uevr_modifiers: %s\n", e.what());
+    } catch (...) {
+        DriverLog("v3.1: Unknown error parsing uevr_modifiers\n");
+    }
 }
