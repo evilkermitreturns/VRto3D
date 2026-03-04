@@ -112,6 +112,7 @@ private:
 
     std::string stereo_model_number_;
     std::string stereo_serial_number_;
+    std::string stereo_version_number_;
 
     std::string app_name_;
     std::string prev_name_;
@@ -125,6 +126,7 @@ private:
     std::atomic< bool > man_on_top_;
     std::atomic< bool > take_screenshot_;
     std::atomic< bool > use_auto_depth_;
+    std::atomic< bool > launch_script_executed_;
 
     std::mutex pose_mutex_;
     vr::DriverPose_t curr_pose_;

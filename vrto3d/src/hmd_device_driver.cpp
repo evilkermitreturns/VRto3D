@@ -28,6 +28,8 @@
 #include <string>
 #include <sstream>
 #include <ctime>
+#include <cstdlib>
+#include <cstring>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -50,6 +52,7 @@ MockControllerDeviceDriver::MockControllerDeviceDriver()
     app_name_ = "";
     prev_name_ = "";
     app_pid_ = 0;
+    launch_script_executed_ = false;
 
     auto* vrs = vr::VRSettings();
     JsonManager json_manager;
@@ -61,6 +64,9 @@ MockControllerDeviceDriver::MockControllerDeviceDriver()
     char serial_number[ 1024 ];
     vrs->GetString( stereo_main_settings_section, "serial_number", serial_number, sizeof( serial_number ) );
     stereo_serial_number_ = serial_number;
+    char version_number[ 1024 ];
+    vrs->GetString( stereo_main_settings_section, "version_number", version_number, sizeof( version_number ) );
+    stereo_version_number_ = version_number;
 
     DriverLog( "VRto3D Model Number: %s", stereo_model_number_.c_str() );
     DriverLog( "VRto3D Serial Number: %s", stereo_serial_number_.c_str() );
@@ -69,12 +75,25 @@ MockControllerDeviceDriver::MockControllerDeviceDriver()
 
     // Display settings
     StereoDisplayDriverConfiguration display_configuration{};
+    display_configuration.display_index = 0;
     display_configuration.window_x = 0;
     display_configuration.window_y = 0;
+    display_configuration.window_width = 1920;
+    display_configuration.window_height = 1080;
     json_manager.LoadParamsFromJson(display_configuration);
 
     // Profile settings
     json_manager.LoadProfileFromJson(DEF_CFG, display_configuration);
+
+    // Resolve display-index-driven window bounds from the active desktop layout
+    const bool monitor_bounds_applied = ApplyDisplaySelectionToWindowConfig(display_configuration);
+    DriverLog("Pre-init window bounds before StereoDisplayComponent: resolved=%s display_index=%d bounds=(%d,%d %dx%d)",
+        monitor_bounds_applied ? "true" : "false",
+        display_configuration.display_index,
+        display_configuration.window_x,
+        display_configuration.window_y,
+        display_configuration.window_width,
+        display_configuration.window_height);
 
     // Instantiate our display component
     stereo_display_component_ = std::make_unique< StereoDisplayComponent >( display_configuration );
@@ -223,6 +242,23 @@ vr::EVRInitError MockControllerDeviceDriver::Activate( uint32_t unObjectId )
     vrs->SetBool(vr::k_pch_SteamVR_Section, vr::k_pch_SteamVR_ForceFadeOnBadTracking_Bool, false);
     vrs->SetBool(vr::k_pch_SteamVR_Section, vr::k_pch_SteamVR_ActivateMultipleDrivers_Bool, true);
     vrs->SetString(vr::k_pch_SteamVR_Section, vr::k_pch_SteamVR_ForcedDriverKey_String, "vrto3d");
+
+    const auto launch_script = stereo_display_component_->GetConfig().launch_script;
+    bool can_execute_launch_script = false;
+    if (!launch_script.empty() && launch_script_executed_.compare_exchange_strong(can_execute_launch_script, true))
+    {
+        std::thread([launch_script]() {
+            DriverLog("Executing launch_script: %s\n", launch_script.c_str());
+            const std::string command = "cmd.exe /C " + launch_script;
+            const int result = std::system(command.c_str());
+            if (result == 0) {
+                DriverLog("launch_script completed successfully\n");
+            }
+            else {
+                DriverLog("launch_script failed with exit code: %d\n", result);
+            }
+        }).detach();
+    }
     
     // Thread setup
     pose_thread_ = std::thread(&MockControllerDeviceDriver::PoseUpdateThread, this);
@@ -880,6 +916,8 @@ void MockControllerDeviceDriver::PollHotkeysThread() {
         return ss.str();
     };
 
+    setOverlay("VRto3D: " + stereo_version_number_);
+
     while (is_active_) {
         auto cfg = stereo_display_component_->GetConfig();
 
@@ -913,6 +951,7 @@ void MockControllerDeviceDriver::PollHotkeysThread() {
                 if (!prev_name_.empty()) {
                     cfg.depth = stereo_display_component_->GetDepth();
                     cfg.convergence = stereo_display_component_->GetConvergence();
+                    cfg.fov = stereo_display_component_->GetFoV();
                     JsonManager().SaveProfileToJson(prev_name_ + "_config.json", cfg);
                     BeepSuccess();
                     setOverlay("Saved " + prev_name_ + "_config.json profile");
@@ -1066,8 +1105,6 @@ void MockControllerDeviceDriver::FocusUpdateThread()
 {
     static int sleep_time = 1000;
     static HWND vr_window = NULL;
-    static HWND ww_window = NULL;
-    static HWND main_window = NULL;
     static HWND top_window = NULL;
     static HWND game_window = NULL;
     static LONG ex_style = 0;
@@ -1075,6 +1112,7 @@ void MockControllerDeviceDriver::FocusUpdateThread()
     static DWORD last_pid = 0;
     static bool was_on_top = false;
     static bool was_focused = false;
+    static bool window_bounds_applied = false;
 
     while (is_active_)
     {
@@ -1086,24 +1124,47 @@ void MockControllerDeviceDriver::FocusUpdateThread()
             }
         }
 
+        // Place the Headset Window once on creation + one delayed retry.
+        if (vr_window != NULL && !window_bounds_applied) {
+            auto cfg = stereo_display_component_->GetConfig();
+            ApplyDisplaySelectionToWindowConfig(cfg);
+
+            DriverLog(
+                "Applying Headset Window placement to (%d,%d %ux%u)",
+                cfg.window_x,
+                cfg.window_y,
+                cfg.window_width,
+                cfg.window_height);
+
+            SetWindowPos(
+                vr_window,
+                nullptr,
+                cfg.window_x,
+                cfg.window_y,
+                cfg.window_width,
+                cfg.window_height,
+                SWP_NOACTIVATE | SWP_NOZORDER);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            SetWindowPos(
+                vr_window,
+                nullptr,
+                cfg.window_x,
+                cfg.window_y,
+                cfg.window_width,
+                cfg.window_height,
+                SWP_NOACTIVATE | SWP_NOZORDER);
+
+            window_bounds_applied = true;
+        }
+
         // Keep VR display always on top for 3D rendering
         if (is_on_top_ && IsProcessRunning(app_pid_)) {
-            if (ww_window == NULL && !was_on_top) {
-                ww_window = FindWindow(NULL, L"WibbleWobble");
-                if (ww_window != NULL) {
-                    if (vr_window != NULL) {
-                        SetWindowPos(main_window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-                        SetWindowLong(main_window, GWL_EXSTYLE, (ex_style | WS_EX_LAYERED) & ~WS_EX_TRANSPARENT);
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                    }
-                    ex_style = GetWindowLong(ww_window, GWL_EXSTYLE);
-                }
-            }
             top_window = GetTopWindow(GetDesktopWindow());
-            main_window = ww_window != NULL ? ww_window : vr_window;
-            if (main_window != NULL && main_window != top_window) {
-                SetWindowPos(main_window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-                SetWindowLong(main_window, GWL_EXSTYLE, ex_style | (WS_EX_LAYERED | WS_EX_TRANSPARENT));
+            if (vr_window != NULL && vr_window != top_window) {
+                SetWindowPos(vr_window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                SetWindowLong(vr_window, GWL_EXSTYLE, ex_style | (WS_EX_LAYERED | WS_EX_TRANSPARENT));
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
                 // Recenter VR
@@ -1118,9 +1179,9 @@ void MockControllerDeviceDriver::FocusUpdateThread()
             was_on_top = true;
         }
         // Unfocus and check to see if the game is still running to re-enable focus
-        else if (main_window != NULL && was_on_top) {
-            SetWindowPos(main_window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            SetWindowLong(main_window, GWL_EXSTYLE, (ex_style | WS_EX_LAYERED) & ~WS_EX_TRANSPARENT);
+        else if (vr_window != NULL && was_on_top) {
+            SetWindowPos(vr_window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            SetWindowLong(vr_window, GWL_EXSTYLE, (ex_style | WS_EX_LAYERED) & ~WS_EX_TRANSPARENT);
             if (man_on_top_)
             {
                 std::this_thread::sleep_for(std::chrono::seconds(15));
@@ -1245,7 +1306,7 @@ void MockControllerDeviceDriver::AutoDepthThread() {
 
 
 //-----------------------------------------------------------------------------
-// Purpose: Load Game Specific Settings from Documents\My games\vrto3d\app_name_config.json
+// Purpose: Load Game Specific Settings from Steam\config\vrto3d\app_name_config.json
 //-----------------------------------------------------------------------------
 void MockControllerDeviceDriver::LoadSettings(const std::string& app_name, uint32_t app_pid, vr::EVREventType status)
 {
@@ -1598,8 +1659,8 @@ bool StereoDisplayComponent::ComputeInverseDistortion(vr::HmdVector2_t* pResult,
 void StereoDisplayComponent::GetWindowBounds( int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight )
 {
     std::shared_lock<std::shared_mutex> lock(cfg_mutex_);
-    *pnX = config_.window_x;
-    *pnY = config_.window_y;
+    *pnX = 0;
+    *pnY = 0;
     *pnWidth = config_.window_width;
     *pnHeight = config_.window_height;
 }
@@ -1867,7 +1928,7 @@ void StereoDisplayComponent::SetReset()
 
 
 //-----------------------------------------------------------------------------
-// Purpose: Load Game Specific Settings from Documents\My games\vrto3d\app_name_config.json
+// Purpose: Load Game Specific Settings from Steam\config\vrto3d\app_name_config.json
 //-----------------------------------------------------------------------------
 void StereoDisplayComponent::LoadSettings(StereoDisplayDriverConfiguration& config)
 {
@@ -1875,7 +1936,8 @@ void StereoDisplayComponent::LoadSettings(StereoDisplayDriverConfiguration& conf
     AdjustDepth(config.depth, false);
     AdjustConvergence(config.convergence, false);
     uevr::receiver().set_base_depth(config.depth);
-    
+    AdjustFoV(config.fov);
+
     std::unique_lock<std::shared_mutex> lock(cfg_mutex_);
     config_ = config;
     lock.unlock();
