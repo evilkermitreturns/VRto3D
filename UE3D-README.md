@@ -48,11 +48,6 @@ The bridge protocol file (`uevr_vrto3d_protocol.h`) must be identical in both th
 "C:/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe" vrto3d.sln -p:Configuration=Release -p:Platform=x64 -m -verbosity:minimal
 ```
 
-## Known Limitations
-
-- **16:9 only** — no ultrawide 3D monitors exist yet
-- **SteamVR required** — VRto3D is a SteamVR driver, so SteamVR has to be running
-- **One UEVR instance** — the shared memory bridge is a single named block, so only one game at a time
 
 ## Credits
 

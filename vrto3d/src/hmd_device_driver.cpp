@@ -1260,7 +1260,6 @@ void MockControllerDeviceDriver::LoadSettings(const std::string& app_name, uint3
         if (JsonManager().LoadProfileFromJson(app_name + "_config.json", config))
         {
             stereo_display_component_->LoadSettings(config);
-            parse_uevr_modifiers(app_name);  // v3.1: load depth curve overrides
             DriverLog("Loaded %s profile\n", app_name.c_str());
             BeepSuccess();
             app_updated_ = true;
@@ -1896,66 +1895,4 @@ void StereoDisplayComponent::ResetProjection()
     vr::VREvent_Data_t temp;
     vr::VRServerDriverHost()->SetDisplayProjectionRaw(device_index_, eyeLeft, eyeRight);
     vr::VRServerDriverHost()->VendorSpecificEvent(device_index_, vr::VREvent_LensDistortionChanged, temp, 0.0f);
-}
-
-
-//-----------------------------------------------------------------------------
-// Purpose: v3.1 - Parse uevr_modifiers from VRto3D game profile JSON
-//-----------------------------------------------------------------------------
-void MockControllerDeviceDriver::parse_uevr_modifiers(const std::string& app_name)
-{
-    uevr::receiver().clear_modifiers();
-
-    try {
-        char documents_path[MAX_PATH];
-        if (FAILED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, documents_path))) {
-            return;
-        }
-        std::string full_path = std::string(documents_path) + "\\My Games\\vrto3d\\" + app_name + "_config.json";
-
-        std::ifstream file(full_path);
-        if (!file.is_open()) {
-            return;
-        }
-
-        nlohmann::json json;
-        file >> json;
-
-        if (!json.contains("uevr_modifiers") || !json["uevr_modifiers"].is_object()) {
-            return;
-        }
-
-        auto& m = json["uevr_modifiers"];
-        uevr::ProfileModifiers mods{};
-        mods.active = true;
-
-        auto read_float = [&](const char* key, float& out) {
-            if (m.contains(key) && m[key].is_number())
-                out = m[key].get<float>();
-        };
-
-        read_float("depth_strength",    mods.depth_strength);
-        read_float("depth_min_floor",   mods.depth_min_floor);
-        read_float("ads_floor",         mods.ads_floor);
-        read_float("scope_floor",       mods.scope_floor);
-        read_float("cutscene_floor",    mods.cutscene_floor);
-        read_float("base_power",        mods.base_power);
-        read_float("extra_power",       mods.extra_power);
-        read_float("dead_zone",         mods.dead_zone);
-        read_float("transition_speed",  mods.transition_speed);
-        read_float("zoom_threshold",    mods.zoom_threshold);
-        read_float("base_fov_override", mods.base_fov_override);
-        // v3.4: Per-mode convergence blend overrides
-        read_float("blend_ads",         mods.blend_ads);
-        read_float("blend_scope",       mods.blend_scope);
-        read_float("blend_passive",     mods.blend_passive);
-
-        uevr::receiver().write_modifiers(mods);
-        DriverLog("v3.1: Loaded uevr_modifiers from %s_config.json\n", app_name.c_str());
-
-    } catch (const std::exception& e) {
-        DriverLog("v3.1: Error parsing uevr_modifiers: %s\n", e.what());
-    } catch (...) {
-        DriverLog("v3.1: Unknown error parsing uevr_modifiers\n");
-    }
 }

@@ -22,7 +22,7 @@
 #include <string>
 
 #include "vrto3dlib/json_manager.h"
-#include "uevr_receiver.hpp"
+#include "vrto3dlib/uevr_receiver.hpp"
 
  // Forward declare XINPUT_STATE
 struct _XINPUT_STATE;
@@ -106,7 +106,6 @@ public:
 
     void LoadSettings(const std::string& app_name, uint32_t app_pid, vr::EVREventType status);
     void SetAsync(bool enable);
-    void parse_uevr_modifiers(const std::string& app_name);  // v3.1
 
 private:
     std::unique_ptr< StereoDisplayComponent > stereo_display_component_;
