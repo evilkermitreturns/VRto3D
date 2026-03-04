@@ -421,36 +421,32 @@ void MockControllerDeviceDriver::PoseUpdateThread()
                 uevr_was_connected = connected;
             }
 
-            // === AUTO-DEPTH (unified — no hard threshold switch) ===
-            // Always use smoothed depth path to prevent compositor jolt
-            // on threshold crossing when depth_multiplier approaches 1.0.
-            float new_sep;
+            // VR mode only: depth smoothing for asymmetric projection
+            // Monitor mode: UEVR owns depth via projection [2][0], VRto3D just displays
+            float new_sep = current_depth;
+            if (!stereo_display_component_->IsMonitorMode()) {
+                if (uevr::receiver().is_connected() && uevr::receiver().has_valid_data()) {
+                    new_sep = uevr::receiver().get_depth_for_rendering(deltaTime);
 
-            if (uevr::receiver().is_connected() && uevr::receiver().has_valid_data()) {
-                // Always use smoothed path — even when returning to 1.0
-                new_sep = uevr::receiver().get_depth_for_rendering(deltaTime);
+                    bool depth_active = std::abs(uevr::receiver().get_depth_multiplier() - 1.0f) > 0.01f;
+                    uevr::receiver().mark_depth_active(depth_active);
 
-                bool depth_active = std::abs(uevr::receiver().get_depth_multiplier() - 1.0f) > 0.01f;
-                uevr::receiver().mark_depth_active(depth_active);
+                    static bool prev_depth_active = false;
+                    if (depth_active != prev_depth_active) {
+                        DriverLog("UEVR depth: %s (eff=%.4f mult=%.3f)\n",
+                            depth_active ? "ACTIVE" : "INACTIVE",
+                            new_sep, uevr::receiver().get_depth_multiplier());
+                        prev_depth_active = depth_active;
+                    }
 
-                // v3.4: Log depth state transitions (active/inactive)
-                static bool prev_depth_active = false;
-                if (depth_active != prev_depth_active) {
-                    DriverLog("UEVR depth: %s (eff=%.4f mult=%.3f)\n",
-                        depth_active ? "ACTIVE" : "INACTIVE",
-                        new_sep, uevr::receiver().get_depth_multiplier());
-                    prev_depth_active = depth_active;
+                    if (depth_active && uevr_log_counter++ % 200 == 0) {
+                        DriverLog("UEVR depth: eff=%.4f base=%.4f mult=%.3f\n",
+                            new_sep, current_depth, uevr::receiver().get_depth_multiplier());
+                    }
                 }
 
-                if (depth_active && uevr_log_counter++ % 200 == 0) {
-                    DriverLog("UEVR depth: eff=%.4f base=%.4f mult=%.3f\n",
-                        new_sep, current_depth, uevr::receiver().get_depth_multiplier());
-                }
-            } else {
-                new_sep = current_depth;
+                stereo_display_component_->SetUEVREffectiveDepth(new_sep);
             }
-
-            stereo_display_component_->SetUEVREffectiveDepth(new_sep);
 
             // Monitor mode: latch on valid data, don't revert on stale (lesson 20)
             if (uevr::receiver().is_connected() && uevr::receiver().has_valid_data()) {
@@ -553,6 +549,10 @@ void MockControllerDeviceDriver::PoseUpdateThread()
                 uevr::receiver().clear_depth_request();
             }
             // === END UEVR DEPTH COMMANDS ===
+
+            // VR mode only: convergence, aim correction, FOV compensation, ResetProjection
+            // Monitor mode: GetProjectionRaw returns symmetric frustum, these atomics are unused
+            if (!stereo_display_component_->IsMonitorMode()) {
 
             // === SETTLED-STATE PROJECTION UPDATES ===
             //
@@ -717,6 +717,30 @@ void MockControllerDeviceDriver::PoseUpdateThread()
                 }
                 reset_proj_count = 0;
             }
+
+            } else {
+                // Monitor mode: heartbeat + hint-based overlay IPD
+                // receiver.update() writes vrto3d_connected/timestamp (UEVR heartbeat)
+                // and processes stereo_depth_hint into m_base_depth
+                uevr::receiver().update(
+                    current_depth,
+                    current_convergence,
+                    current_fov,
+                    0.0f,  // no FOV compensation in monitor mode
+                    stereo_display_component_->GetConfig().tab_enable ? 0 : 1,
+                    !no_profile_.load()
+                );
+
+                // Apply stereo_depth_hint to overlay IPD (invariant V7)
+                float hint = uevr::receiver().get_stereo_depth_hint();
+                if (std::isfinite(hint) && hint > 0.001f && hint < 2.0f) {
+                    static float last_hint_ipd = -1.0f;
+                    if (std::abs(hint - last_hint_ipd) > 0.0001f) {
+                        stereo_display_component_->SetUEVREffectiveIPD(hint);
+                        last_hint_ipd = hint;
+                    }
+                }
+            } // end VR/monitor projection block
         }
         // === END UEVR BRIDGE UPDATE ===
 
