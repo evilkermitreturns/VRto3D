@@ -415,7 +415,7 @@ void MockControllerDeviceDriver::PoseUpdateThread()
                     uint32_t mismatch = uevr::receiver().get_last_magic_mismatch();
                     if (mismatch != 0) {
                         DriverLog("UEVR protocol mismatch: expected 0x%08X, got 0x%08X. Check UEVR build.\n",
-                            UEVR_VRTO3D_MAGIC, mismatch);
+                            UE3D_MAGIC, mismatch);
                     }
                 }
                 uevr_was_connected = connected;
